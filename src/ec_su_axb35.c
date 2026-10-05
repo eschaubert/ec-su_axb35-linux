@@ -517,6 +517,7 @@ static struct device_attribute dev_attr_apu_power_mode =
  * Exposes the same EC sensors through the standard hwmon API, so that they
  * show up in 'sensors' and any other hwmon consumer.
  */
+static struct device *ec_hwmon_parent;
 static struct device *ec_hwmon_dev;
 
 static umode_t ec_hwmon_is_visible(const void *data,
@@ -648,6 +649,12 @@ static void ec_update_worker(struct work_struct *work)
 
 static dev_t ec_su_axb35_dev;
 
+/* Minor numbers of the devices created in ec_class */
+#define EC_MINOR_TEMP  (ARRAY_SIZE(ec_fans))
+#define EC_MINOR_APU   (ARRAY_SIZE(ec_fans) + 1)
+#define EC_MINOR_HWMON (ARRAY_SIZE(ec_fans) + 2)
+#define EC_NUM_DEVICES (ARRAY_SIZE(ec_fans) + 3)
+
 static int __init ec_su_axb35_init(void)
 {
     int i;
@@ -655,7 +662,7 @@ static int __init ec_su_axb35_init(void)
 
     BUILD_BUG_ON(ARRAY_SIZE(ec_hwmon_fan_config) != ARRAY_SIZE(ec_fans) + 1);
 
-    ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, ARRAY_SIZE(ec_fans) + 2,
+    ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, EC_NUM_DEVICES,
                               "ec_su_axb35");
     if (ret < 0) {
         pr_err("ec_su_axb35: Failed to allocation major number\n");
@@ -669,7 +676,7 @@ static int __init ec_su_axb35_init(void)
 #endif
 
     if (IS_ERR(ec_class)) {
-        unregister_chrdev_region(ec_su_axb35_dev, ARRAY_SIZE(ec_fans) + 2);
+        unregister_chrdev_region(ec_su_axb35_dev, EC_NUM_DEVICES);
         return PTR_ERR(ec_class);
     }
 
@@ -691,8 +698,8 @@ static int __init ec_su_axb35_init(void)
     }
 
     ec_temp.dev = device_create(
-        ec_class, NULL, MKDEV(MAJOR(ec_su_axb35_dev), ARRAY_SIZE(ec_fans)),
-        &ec_temp, ec_temp.name);
+        ec_class, NULL, MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_TEMP), &ec_temp,
+        ec_temp.name);
     if (!IS_ERR(ec_temp.dev)) {
         dev_set_drvdata(ec_temp.dev, &ec_temp);
         device_create_file(ec_temp.dev, &dev_attr_temp_cur);
@@ -700,20 +707,32 @@ static int __init ec_su_axb35_init(void)
         device_create_file(ec_temp.dev, &dev_attr_temp_max);
     }
 
-    ec_apu.dev = device_create(
-        ec_class, NULL, MKDEV(MAJOR(ec_su_axb35_dev), ARRAY_SIZE(ec_fans) + 1),
-        &ec_apu, ec_apu.name);
+    ec_apu.dev = device_create(ec_class, NULL,
+                               MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_APU),
+                               &ec_apu, ec_apu.name);
     if (!IS_ERR(ec_apu.dev)) {
         dev_set_drvdata(ec_apu.dev, &ec_apu);
         device_create_file(ec_apu.dev, &dev_attr_apu_power_mode);
     }
 
-    ec_hwmon_dev = hwmon_device_register_with_info(
-        NULL, "ec_su_axb35", NULL, &ec_hwmon_chip_info, NULL);
-    if (IS_ERR(ec_hwmon_dev)) {
-        pr_warn("ec_su_axb35: Failed to register hwmon device: %ld\n",
-                PTR_ERR(ec_hwmon_dev));
-        ec_hwmon_dev = NULL;
+    /*
+     * The hwmon core requires a parent device, so create a plain class
+     * device to hang the hwmon device off.
+     */
+    ec_hwmon_parent = device_create(ec_class, NULL,
+                                    MKDEV(MAJOR(ec_su_axb35_dev),
+                                          EC_MINOR_HWMON),
+                                    NULL, "ec_hwmon");
+    if (IS_ERR(ec_hwmon_parent)) {
+        ec_hwmon_parent = NULL;
+    } else {
+        ec_hwmon_dev = hwmon_device_register_with_info(
+            ec_hwmon_parent, "ec_su_axb35", NULL, &ec_hwmon_chip_info, NULL);
+        if (IS_ERR(ec_hwmon_dev)) {
+            pr_warn("ec_su_axb35: Failed to register hwmon device: %ld\n",
+                    PTR_ERR(ec_hwmon_dev));
+            ec_hwmon_dev = NULL;
+        }
     }
 
     INIT_DELAYED_WORK(&ec_update_work, ec_update_worker);
@@ -730,6 +749,10 @@ static void __exit ec_su_axb35_exit(void)
     if (ec_hwmon_dev) {
         hwmon_device_unregister(ec_hwmon_dev);
         ec_hwmon_dev = NULL;
+    }
+    if (ec_hwmon_parent) {
+        device_destroy(ec_class, MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_HWMON));
+        ec_hwmon_parent = NULL;
     }
 
     /* Reset all fans to AUTO mode before unloading */
@@ -771,20 +794,18 @@ static void __exit ec_su_axb35_exit(void)
         device_remove_file(ec_temp.dev, &dev_attr_temp_cur);
         device_remove_file(ec_temp.dev, &dev_attr_temp_min);
         device_remove_file(ec_temp.dev, &dev_attr_temp_max);
-        device_destroy(ec_class,
-                       MKDEV(MAJOR(ec_su_axb35_dev), ARRAY_SIZE(ec_fans)));
+        device_destroy(ec_class, MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_TEMP));
     }
 
     if (!IS_ERR(ec_apu.dev)) {
         device_remove_file(ec_apu.dev, &dev_attr_apu_power_mode);
-        device_destroy(ec_class,
-                       MKDEV(MAJOR(ec_su_axb35_dev), ARRAY_SIZE(ec_fans) + 1));
+        device_destroy(ec_class, MKDEV(MAJOR(ec_su_axb35_dev), EC_MINOR_APU));
     }
 
     cancel_delayed_work_sync(&ec_update_work);
 
     class_destroy(ec_class);
-    unregister_chrdev_region(ec_su_axb35_dev, ARRAY_SIZE(ec_fans) + 2);
+    unregister_chrdev_region(ec_su_axb35_dev, EC_NUM_DEVICES);
     pr_info("ec_su_axb35: Module unloaded\n");
 }
 
