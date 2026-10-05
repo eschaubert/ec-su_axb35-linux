@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/hwmon.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -76,20 +77,40 @@ static struct ec_apu ec_apu = {
     .power_mode_reg = 0x31,
 };
 
+static int ec_fan_read_rpm(const struct ec_fan *fan, u16 *rpm)
+{
+    u8  hi;
+    u8  lo;
+    int ret;
+
+    ret = ec_read(fan->speed_reg_high, &hi);
+    if (ret)
+        return ret;
+
+    ret = ec_read(fan->speed_reg_low, &lo);
+    if (ret)
+        return ret;
+
+    *rpm = (hi << 8) | lo;
+
+    // wired fan3 behavior, displaying 8000 before turning to 0
+    if (strcmp(fan->name, "fan3") == 0 && *rpm == 8000)
+        *rpm = 0;
+
+    return 0;
+}
+
 static ssize_t fan_rpm_show(struct device *dev, struct device_attribute *attr,
                             char *buf)
 {
     struct ec_fan *fan = dev_get_drvdata(dev);
-    u8             hi;
-    // TODO: handle error
-    ec_read(fan->speed_reg_high, &hi);
-    u8 lo;
-    // TODO: handle error
-    ec_read(fan->speed_reg_low, &lo);
-    u16 rpm = (hi << 8) | lo;
-    // wired fan3 behavior, displaying 8000 before turning to 0
-    if (strcmp(fan->name, "fan3") == 0 && rpm == 8000)
-        rpm = 0;
+    u16            rpm;
+    int            ret;
+
+    ret = ec_fan_read_rpm(fan, &rpm);
+    if (ret)
+        return ret;
+
     return sprintf(buf, "%u\n", rpm);
 }
 
@@ -490,6 +511,107 @@ static ssize_t apu_power_mode_store(struct device           *dev,
 static struct device_attribute dev_attr_apu_power_mode =
     __ATTR(power_mode, 0644, apu_power_mode_show, apu_power_mode_store);
 
+/*
+ * hwmon interface.
+ *
+ * Exposes the same EC sensors through the standard hwmon API, so that they
+ * show up in 'sensors' and any other hwmon consumer.
+ */
+static struct device *ec_hwmon_dev;
+
+static umode_t ec_hwmon_is_visible(const void *data,
+                                   enum hwmon_sensor_types type, u32 attr,
+                                   int channel)
+{
+    switch (type) {
+    case hwmon_temp:
+        if (attr == hwmon_temp_input)
+            return 0444;
+        break;
+    case hwmon_fan:
+        if (attr == hwmon_fan_input && channel < (int) ARRAY_SIZE(ec_fans))
+            return 0444;
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int ec_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+                         u32 attr, int channel, long *val)
+{
+    switch (type) {
+    case hwmon_temp:
+        if (attr == hwmon_temp_input) {
+            u8  temp;
+            int ret;
+
+            ret = ec_read(ec_temp.reg, &temp);
+            if (ret)
+                return ret;
+
+            *val = temp * 1000; // hwmon reports millidegrees
+            return 0;
+        }
+        break;
+    case hwmon_fan:
+        if (attr == hwmon_fan_input && channel < (int) ARRAY_SIZE(ec_fans)) {
+            u16 rpm;
+            int ret;
+
+            ret = ec_fan_read_rpm(&ec_fans[channel], &rpm);
+            if (ret)
+                return ret;
+
+            *val = rpm;
+            return 0;
+        }
+        break;
+    default:
+        break;
+    }
+    return -EOPNOTSUPP;
+}
+
+static const struct hwmon_ops ec_hwmon_ops = {
+    .is_visible = ec_hwmon_is_visible,
+    .read       = ec_hwmon_read,
+};
+
+static const u32 ec_hwmon_temp_config[] = {
+    HWMON_T_INPUT,
+    0,
+};
+
+static const u32 ec_hwmon_fan_config[] = {
+    HWMON_F_INPUT,
+    HWMON_F_INPUT,
+    HWMON_F_INPUT,
+    0,
+};
+
+static const struct hwmon_channel_info ec_hwmon_temp_info = {
+    .type   = hwmon_temp,
+    .config = ec_hwmon_temp_config,
+};
+
+static const struct hwmon_channel_info ec_hwmon_fan_info = {
+    .type   = hwmon_fan,
+    .config = ec_hwmon_fan_config,
+};
+
+static const struct hwmon_channel_info *ec_hwmon_info[] = {
+    &ec_hwmon_temp_info,
+    &ec_hwmon_fan_info,
+    NULL,
+};
+
+static const struct hwmon_chip_info ec_hwmon_chip_info = {
+    .ops  = &ec_hwmon_ops,
+    .info = ec_hwmon_info,
+};
+
 static struct delayed_work ec_update_work;
 
 static void ec_update_worker(struct work_struct *work)
@@ -524,13 +646,14 @@ static void ec_update_worker(struct work_struct *work)
                           msecs_to_jiffies(1000)); // every 1 sec
 }
 
-static dev_t         ec_su_axb35_dev;
-static struct class *ec_class;
+static dev_t ec_su_axb35_dev;
 
 static int __init ec_su_axb35_init(void)
 {
     int i;
     int ret;
+
+    BUILD_BUG_ON(ARRAY_SIZE(ec_hwmon_fan_config) != ARRAY_SIZE(ec_fans) + 1);
 
     ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, ARRAY_SIZE(ec_fans) + 2,
                               "ec_su_axb35");
@@ -585,6 +708,14 @@ static int __init ec_su_axb35_init(void)
         device_create_file(ec_apu.dev, &dev_attr_apu_power_mode);
     }
 
+    ec_hwmon_dev = hwmon_device_register_with_info(
+        NULL, "ec_su_axb35", NULL, &ec_hwmon_chip_info, NULL);
+    if (IS_ERR(ec_hwmon_dev)) {
+        pr_warn("ec_su_axb35: Failed to register hwmon device: %ld\n",
+                PTR_ERR(ec_hwmon_dev));
+        ec_hwmon_dev = NULL;
+    }
+
     INIT_DELAYED_WORK(&ec_update_work, ec_update_worker);
     schedule_delayed_work(&ec_update_work, msecs_to_jiffies(1000));
 
@@ -595,6 +726,11 @@ static int __init ec_su_axb35_init(void)
 static void __exit ec_su_axb35_exit(void)
 {
     int i;
+
+    if (ec_hwmon_dev) {
+        hwmon_device_unregister(ec_hwmon_dev);
+        ec_hwmon_dev = NULL;
+    }
 
     /* Reset all fans to AUTO mode before unloading */
     for (i = 0; i < ARRAY_SIZE(ec_fans); i++) {

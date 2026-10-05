@@ -42,6 +42,20 @@ $ sudo insmod ec_su_axb35
 /sys/class/ec_su_axb35/apu/power_mode      (RW) - [quiet, balanced, performance]
 ```
 
+# hwmon
+In addition to the sysfs interface above, the driver registers a standard hwmon
+device (name `ec_su_axb35`), so the sensors are visible to `sensors` and any
+other hwmon consumer:
+
+```
+/sys/class/hwmon/hwmonX/temp1_input    (RO) - CPU temperature in millidegrees C
+/sys/class/hwmon/hwmonX/fan1_input     (RO) - fan 1 speed in rpm
+/sys/class/hwmon/hwmonX/fan2_input     (RO) - fan 2 speed in rpm
+/sys/class/hwmon/hwmonX/fan3_input     (RO) - fan 3 speed in rpm
+```
+
+Use `$ sensors` to list them.
+
 # Python GUI app (needs root to write to /sys/class/ec_su_axb35/*)
 to test:
 python ./ec-su_axb35-linux-gui.py
